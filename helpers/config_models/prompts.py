@@ -1,45 +1,22 @@
 from datetime import datetime, UTC
-from fastapi.encoders import jsonable_encoder
 from functools import cached_property
 from logging import Logger
-from models.claim import ClaimModel
-from models.message import (
-    ActionEnum as MessageAction,
-    MessageModel,
-    PersonaEnum as MessagePersona,
-    StyleEnum as MessageStyle,
-)
 from azure.core.exceptions import HttpResponseError
 from models.call import CallModel
-from models.next import ActionEnum as NextAction
-from models.reminder import ReminderModel
-from models.training import TrainingModel
-from pydantic import computed_field, BaseModel
+from pydantic import computed_field
 from pydantic_settings import BaseSettings
 from textwrap import dedent
-from typing import List, Optional, Union, Set
-import json
-
-
-def _pydantic_to_str(
-    model: Optional[Union[BaseModel, List[BaseModel]]],
-    exclude: Optional[Set[str]] = None,
-) -> str:
-    """
-    Convert a Pydantic model to a JSON string.
-
-    If None, return "None" as a string.
-    """
-    if not model:
-        return "None"
-    return json.dumps(
-        jsonable_encoder(
-            model.model_dump(exclude=exclude)
-            if isinstance(model, BaseModel)
-            else [m.model_dump(exclude=exclude) for m in model]
-        )
-    )
-
+from semantic_kernel import (
+    Kernel,
+    PromptTemplateConfig,
+    SemanticFunctionConfig,
+    ChatPromptTemplate,
+)
+from semantic_kernel.orchestration.kernel_function import KernelFunction
+from semantic_kernel.template_engine.prompt_template_engine import PromptTemplateEngine
+from semantic_kernel.connectors.ai.open_ai.prompt_execution_settings.azure_chat_prompt_execution_settings import (
+    AzureChatPromptExecutionSettings,
+)
 
 class SoundModel(BaseSettings):
     loading_tpl: str = "{public_url}/loading.wav"
@@ -68,10 +45,10 @@ class LlmModel(BaseSettings):
     """
 
     default_system_tpl: str = """
-        Assistant is called {bot_name} and is working in a call center for company {bot_company} as an expert with 20 years of experience. {bot_company} is a well-known and trusted insurance company in France. Assistant is proud to work for {bot_company}. Take a deep breath. This is critical for the customer.
+        Assistant is called {{$bot_name}} and is working in a call center for company {{$bot_company}} as an expert with 20 years of experience. {{$bot_company}} is a well-known and trusted insurance company in France. Assistant is proud to work for {{$bot_company}}. Take a deep breath. This is critical for the customer.
 
         # Context
-        Today is {date}. The customer is calling from {phone_number}. The call center number is {bot_phone_number}.
+        Today is {{Time.utcNow}}. The customer is calling from {{$phone_number}}. The call center number is {{$bot_phone_number}}.
     """
     chat_system_tpl: str = """
         # Objective
@@ -79,13 +56,13 @@ class LlmModel(BaseSettings):
 
         # Rules
         - Answer directly to the customer's questions
-        - Answers in {default_lang}, even if the customer speaks another language
+        - Answers in {{$default_lang}}, even if the customer speaks another language
         - Aways answer with at least one full sentence
         - Be proactive in the reminders you create, customer assistance is your priority
         - Do not ask for something which is already stored in the claim
         - Do not ask the customer more than 2 questions in a row
         - Don't have access to any other means of communication with the customer (e.g., email, SMS, chat, web portal), only the phone call
-        - Each message from the history is prefixed from where it has been said ({actions})
+        - Each message from the history is prefixed from where it has been said ({{actions}})
         - If user calls multiple times, continue the discussion from the previous call
         - If you don't know how to answer, say "I don't know"
         - If you don't understand the question, ask the customer to rephrase it
@@ -98,7 +75,7 @@ class LlmModel(BaseSettings):
         - Welcome the customer when they call
         - When the customer says a word and then spells out letters, this means that the word is written in the way the customer spelled it (e.g., "I live in Paris PARIS", "My name is John JOHN", "My email is Clemence CLEMENCE at gmail GMAIL dot com COM")
         - Will answer the customer's questions if they are related to their contract, claim, or insurance
-        - Work for {bot_company}, not someone else
+        - Work for {{$bot_company}}, not someone else
 
         # Required customer data to be gathered by the assistant (if not already in the claim)
         - Address
@@ -117,13 +94,13 @@ class LlmModel(BaseSettings):
         6. Be proactive and create reminders for the customer (e.g., follup up on the claim, send documents)
 
         # Allowed styles
-        {styles}
+        {{$styles}}
 
         # Claim status
-        {claim}
+        {{$claim}}
 
         # Reminders
-        {reminders}
+        {{$reminders}}
 
         # Response format
         style=[style] [content]
@@ -139,7 +116,7 @@ class LlmModel(BaseSettings):
         Assistant will summarize the call with the customer in a single SMS. The customer cannot reply to this SMS.
 
         # Rules
-        - Answers in {default_lang}, even if the customer speaks another language
+        - Answers in {{$default_lang}}, even if the customer speaks another language
         - Briefly summarize the call with the customer
         - Can include personal details about the customer
         - Cannot talk about any topic besides insurance claims
@@ -153,23 +130,23 @@ class LlmModel(BaseSettings):
         - Won't make any assumptions
 
         # Claim status
-        {claim}
+        {{$claim}}
 
         # Reminders
-        {reminders}
+        {{$reminders}}
 
-        # Conversation history
-        {messages}
+        # Conversation summary
+        {{ConversationSummary.SummarizeConversation $history}}
     """
     synthesis_short_system_tpl: str = """
         # Objective
         Assistant will summarize the call with the customer in a few words. The customer cannot reply to this message, but will read it in their web portal.
 
         # Rules
-        - Answers in {default_lang}, even if the customer speaks another language
+        - Answers in {{$default_lang}}, even if the customer speaks another language
         - Do not prefix the answer with any text (e.g., "The answer is", "Summary of the call")
         - Prefix the answer with a determiner (e.g., "the theft of your car", "your broken window")
-        - Consider all the conversation history, from the beginning
+        - Consider all the conversation summary, from the beginning
         - Won't make any assumptions
 
         # Answer examples
@@ -180,20 +157,20 @@ class LlmModel(BaseSettings):
         - "your broken window"
 
         # Claim status
-        {claim}
+        {{$claim}}
 
         # Reminders
-        {reminders}
+        {{$reminders}}
 
-        # Conversation history
-        {messages}
+        # Conversation summary
+        {{ConversationSummary.SummarizeConversation $history}}
     """
     synthesis_long_system_tpl: str = """
         # Objective
         Assistant will summarize the call with the customer in a paragraph. The customer cannot reply to this message, but will read it in their web portal.
 
         # Rules
-        - Answers in {default_lang}, even if the customer speaks another language
+        - Answers in {{$default_lang}}, even if the customer speaks another language
         - Do not include details of the call process
         - Do not include personal details (e.g., name, phone number, address)
         - Do not prefix the answer with any text (e.g., "The answer is", "Summary of the call")
@@ -205,13 +182,13 @@ class LlmModel(BaseSettings):
         - Won't make any assumptions
 
         # Claim status
-        {claim}
+        {{$claim}}
 
         # Reminders
-        {reminders}
+        {{$reminders}}
 
         # Conversation history
-        {messages}
+        {{$history}}
     """
     citations_system_tpl: str = """
         # Objective
@@ -226,13 +203,13 @@ class LlmModel(BaseSettings):
         - Write citations as Markdown abbreviations at the end of the text (e.g., "*[words from the text]: extract from the conversation")
 
         # Claim status
-        {claim}
+        {{$claim}}
 
         # Reminders
-        {reminders}
+        {{$reminders}}
 
-        # Conversation history
-        {messages}
+        # Conversation summary
+        {{ConversationSummary.SummarizeConversation $history}}
 
         # Response format
         [source text]\\n
@@ -252,7 +229,7 @@ class LlmModel(BaseSettings):
         *[your medical appointment]: "I called my family doctor, I have an appointment for the day after tomorrow."
 
         # Input text
-        {text}
+        {{$text}}
     """
     next_system_tpl: str = """
         # Objective
@@ -264,140 +241,130 @@ class LlmModel(BaseSettings):
         - Write no more than a few sentences as justification
 
         # Allowed actions
-        {actions}
+        {{$actions}}
 
         # Claim status
-        {claim}
+        {{$claim}}
 
         # Reminders
-        {reminders}
+        {{$reminders}}
 
-        # Conversation history
-        {messages}
+        # Conversation summary
+        {{ConversationSummary.SummarizeConversation $history}}
 
         # Response format
-        {{
+        {{{
             "action": "[action]",
             "justification": "[justification]"
-        }}
+        }}}
 
         ## Example 1
-        {{
+        {{{
             "action": "in_depth_study",
             "justification": "The customer has many questions about the insurance policy. They are not sure if they are covered for the incident. The contract seems not to be clear about this situation."
-        }}
+        }}}
 
         ## Example 2
-        {{
+        {{{
             "action": "commercial_offer",
             "justification": "The company planned the customer taxi ride from the wrong address. The customer is not happy about this situation."
-        }}
+        }}}
     """
 
-    def default_system(self, phone_number: str) -> str:
-        from helpers.config import CONFIG
-
-        # TODO: Parse the date from the end-user timezone, allowing LLM to be used in multiple countries
-        return self._return(
-            self.default_system_tpl.format(
-                bot_company=CONFIG.workflow.bot_company,
-                bot_name=CONFIG.workflow.bot_name,
-                bot_phone_number=CONFIG.communication_service.phone_number,
-                date=datetime.now(UTC)
-                .astimezone()
-                .strftime("%Y-%m-%d %H:%M %Z%z"),  # Example 2024-02-01 18:58 CET+0100
-                phone_number=phone_number,
-            )
+    def chat_system(
+        self,
+        kernel: Kernel,
+    ) -> KernelFunction:
+        return self._plugin(
+            kernel=kernel,
+            max_tokens=350,
+            template=self.chat_system_tpl,
         )
 
-    def chat_system(self, call: CallModel, trainings: List[TrainingModel]) -> str:
-        from helpers.config import CONFIG
-
-        return self._return(
-            self.chat_system_tpl,
-            actions=", ".join([action.value for action in MessageAction]),
-            bot_company=CONFIG.workflow.bot_company,
-            claim=_pydantic_to_str(call.claim),
-            default_lang=call.lang.human_name,
-            reminders=_pydantic_to_str(call.reminders),
-            styles=", ".join([style.value for style in MessageStyle]),
-            trainings=trainings,
+    def sms_summary_system(
+        self,
+        kernel: Kernel,
+    ) -> KernelFunction:
+        return self._plugin(
+            kernel=kernel,
+            max_tokens=500,
+            template=self.sms_summary_system_tpl,
         )
 
-    def sms_summary_system(self, call: CallModel) -> str:
-        return self._return(
-            self.sms_summary_system_tpl,
-            claim=_pydantic_to_str(call.claim),
-            default_lang=call.lang.human_name,
-            messages=_pydantic_to_str(call.messages),
-            reminders=_pydantic_to_str(call.reminders),
+    def synthesis_short_system(
+        self,
+        kernel: Kernel,
+    ) -> KernelFunction:
+        return self._plugin(
+            kernel=kernel,
+            max_tokens=100,
+            template=self.synthesis_short_system_tpl,
         )
 
-    def synthesis_short_system(self, call: CallModel) -> str:
-        return self._return(
-            self.synthesis_short_system_tpl,
-            claim=_pydantic_to_str(call.claim),
-            default_lang=call.lang.human_name,
-            messages=_pydantic_to_str(call.messages),
-            reminders=_pydantic_to_str(call.reminders),
+    def synthesis_long_system(
+        self,
+        kernel: Kernel,
+    ) -> KernelFunction:
+        return self._plugin(
+            kernel=kernel,
+            max_tokens=1000,
+            template=self.synthesis_long_system_tpl,
         )
 
-    def synthesis_long_system(self, call: CallModel) -> str:
-        return self._return(
-            self.synthesis_long_system_tpl,
-            claim=_pydantic_to_str(call.claim),
-            default_lang=call.lang.human_name,
-            messages=_pydantic_to_str(call.messages),
-            reminders=_pydantic_to_str(call.reminders),
+    def citations_system(
+        self,
+        kernel: Kernel,
+    ) -> KernelFunction:
+        return self._plugin(
+            kernel=kernel,
+            max_tokens=1000,
+            template=self.citations_system_tpl,
         )
 
-    def citations_system(self, call: CallModel, text: Optional[str]) -> Optional[str]:
-        """
-        Return the formatted prompt. Prompt is used to add citations to the text, without cluttering the content itself.
-
-        The citations system is only used if `text` param is not empty, otherwise `None` is returned.
-        """
-        if not text:
-            return None
-
-        return self._return(
-            self.citations_system_tpl,
-            claim=_pydantic_to_str(call.claim),
-            messages=_pydantic_to_str(
-                [
-                    message
-                    for message in call.messages
-                    if message.persona is not MessagePersona.TOOL
-                ],
-                exclude={"tool_calls"},
-            ),  # Filter out tool messages, to avoid LLM to cite itself
-            reminders=_pydantic_to_str(call.reminders),
-            text=text,
+    def next_system(
+        self,
+        kernel: Kernel,
+    ) -> KernelFunction:
+        return self._plugin(
+            kernel=kernel,
+            max_tokens=1000,
+            template=self.next_system_tpl,
         )
 
-    def next_system(self, call: CallModel) -> str:
-        return self._return(
-            self.next_system_tpl,
-            actions=", ".join([action.value for action in NextAction]),
-            claim=_pydantic_to_str(call.claim),
-            messages=_pydantic_to_str(call.messages),
-            reminders=_pydantic_to_str(call.reminders),
+    def _plugin(
+        self,
+        kernel: Kernel,
+        template: str,
+        max_tokens: int,
+    ) -> KernelFunction:
+        # Settings
+        settings = AzureChatPromptExecutionSettings(
+            max_tokens=max_tokens,
+            temperature=0,  # Most focused and deterministic
+        )  # type: ignore
+        config = PromptTemplateConfig(execution_settings=settings)
+
+        # Template engine
+        prompt_template = ChatPromptTemplate(
+            prompt_config=config,
+            template_engine=PromptTemplateEngine(),
+            template="{{$input}}",
         )
 
-    def _return(
-        self, prompt_tpl: str, trainings: Optional[List[TrainingModel]] = None, **kwargs
-    ) -> str:
-        # Build template
-        res = dedent(prompt_tpl.format(**kwargs))
-        if trainings:
-            res += "\n\n# Trusted data you can use"
-        # Add trainings
-        for i, training in enumerate(trainings or []):
-            res += f"\n\n## Data {i + 1}"
-            res += f"\nTitle: {training.title}"
-            res += f"\nContent: {training.content}"
-        self._logger.debug(f"LLM prompt: {res}")
-        return res
+        # System messages
+        prompt_template.add_system_message(dedent(self.default_system_tpl))
+        prompt_template.add_system_message(dedent(template))
+
+        # Function
+        function_config = SemanticFunctionConfig(
+            prompt_template_config=config,
+            prompt_template=prompt_template,
+        )
+        return kernel.register_semantic_function(
+            function_config=function_config,
+            function_name="chat",
+            plugin_name="default",
+        )
 
     @computed_field
     @cached_property

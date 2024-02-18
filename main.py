@@ -22,11 +22,9 @@ from azure.communication.callautomation import (
     CallAutomationClient,
     CallConnectionClient,
     DtmfTone,
-    FileSource,
     PhoneNumberIdentifier,
     RecognitionChoice,
     RecognizeInputType,
-    SsmlSource,
 )
 from azure.communication.sms import SmsClient
 from azure.core.credentials import AzureKeyCredential
@@ -75,11 +73,12 @@ from models.message import (
     ToolModel as MessageToolModel,
 )
 from helpers.llm import (
+    completion_model_sync,
     completion_stream,
     completion_sync,
-    safety_check,
-    completion_model_sync,
+    build_kernel,
     ModelType,
+    safety_check,
     SafetyCheckError,
 )
 from models.claim import ClaimModel
@@ -87,6 +86,15 @@ from pydantic import ValidationError
 from uuid import UUID
 import json
 import mistune
+from helpers.call import (
+    handle_media,
+    handle_play,
+    handle_recognize_ivr,
+    handle_recognize_text,
+)
+from sk_plugins.call import CallPlugin
+from sk_plugins.claim import ClaimPlugin
+from sk_plugins.reminder import ReminderPlugin
 
 
 # Jinja configuration
@@ -144,7 +152,6 @@ api = FastAPI(
 
 
 CALL_EVENT_URL = f'{CONFIG.api.events_domain.strip("/")}/call/event/{{phone_number}}/{{callback_secret}}'
-SENTENCE_R = r"[^\w\s+\-–—’/'\",:;()@=]"
 MESSAGE_ACTION_R = rf"action=([a-z_]*)( .*)?"
 MESSAGE_STYLE_R = rf"style=([a-z_]*)( .*)?"
 FUNC_NAME_SANITIZER_R = r"[^a-zA-Z0-9_-]"
@@ -532,7 +539,9 @@ async def intelligence(
             text=text,
         )
 
-    chat_task = asyncio.create_task(llm_chat(background_tasks, call, tts_callback))
+    chat_task = asyncio.create_task(
+        llm_chat(background_tasks, call, tts_callback, client)
+    )
     soft_timeout_task = asyncio.create_task(
         asyncio.sleep(CONFIG.workflow.intelligence_soft_timeout_sec)
     )
@@ -631,59 +640,6 @@ async def intelligence(
     return call
 
 
-async def handle_play(
-    client: CallConnectionClient,
-    call: CallModel,
-    text: str,
-    style: MessageStyle = MessageStyle.NONE,
-    context: Optional[str] = None,
-    store: bool = True,
-) -> None:
-    """
-    Play a text to a call participant.
-
-    If store is True, the text will be stored in the call messages. Compatible with text larger than 400 characters, in that case the text will be split in chunks and played sequentially.
-
-    See: https://learn.microsoft.com/en-us/azure/ai-services/speech-service/language-support?tabs=tts
-    """
-    if store:
-        call.messages.append(
-            MessageModel(
-                content=text,
-                persona=MessagePersona.ASSISTANT,
-                style=style,
-            )
-        )
-
-    _logger.info(f"Playing text ({call.call_id}): {text} ({style})")
-
-    # Split text in chunks of max 400 characters, separated by sentence
-    chunks = []
-    chunk = ""
-    for to_add in _sentence_split(text):
-        if len(chunk) + len(to_add) >= 400:
-            chunks.append(chunk.strip())  # Remove trailing space
-            chunk = ""
-        chunk += to_add
-    if chunk:
-        chunks.append(chunk)
-
-    try:
-        for chunk in chunks:
-            _logger.debug(f"Playing chunk: {chunk}")
-            client.play_media(
-                operation_context=context,
-                play_source=audio_from_text(chunk, style, call),
-            )
-    except ResourceNotFoundError:
-        _logger.debug(f"Call hung up before playing ({call.call_id})")
-    except HttpResponseError as e:
-        if "call already terminated" in e.message.lower():
-            _logger.debug(f"Call hung up before playing ({call.call_id})")
-        else:
-            raise e
-
-
 async def llm_completion(system: Optional[str], call: CallModel) -> Optional[str]:
     """
     Run LLM completion from a system prompt and a Call model.
@@ -762,8 +718,8 @@ async def llm_chat(
     background_tasks: BackgroundTasks,
     call: CallModel,
     user_callback: Callable[[str, MessageStyle], Coroutine[Any, Any, None]],
+    client: CallConnectionClient,
     _retry_attempt: int = 0,
-    _trainings: List[AiSearchTrainingModel] = [],
 ) -> Tuple[CallModel, ActionModel]:
     _logger.debug(f"Running LLM chat ({call.call_id})")
 
@@ -820,207 +776,33 @@ async def llm_chat(
             ),
         )
 
-    trainings = _trainings
-    if not trainings:
-        # Query expansion from last messages
-        trainings_tasks = await asyncio.gather(
-            *[
-                search.training_asearch_all(message.content, call)
-                for message in call.messages[-CONFIG.ai_search.expansion_k :]
-            ],
-        )
-        trainings = sorted(
-            set(
-                training
-                for trainings in trainings_tasks
-                for training in trainings or []
-            )
-        )  # Flatten, remove duplicates, and sort by score
+    kernel = build_kernel()
 
-    _logger.info(f"Enhancing LLM chat with {len(trainings)} trainings ({call.call_id})")
-    _logger.debug(f"Trainings: {trainings}")
+    kernel.import_plugin(
+        CallPlugin(
+            call=call,
+            client=client,
+        ),
+        "Call",
+    )
+    kernel.import_plugin(
+        ClaimPlugin(
+            background_tasks=background_tasks,
+            call=call,
+            post_call_next=post_call_next,
+            post_call_synthesis=post_call_synthesis,
+        ),
+        "Claim",
+    )
+    kernel.import_plugin(
+        ReminderPlugin(
+            call=call,
+            client=client,
+        ),
+        "Reminder",
+    )
 
-    messages: List[ChatCompletionMessageParam] = [
-        ChatCompletionSystemMessageParam(
-            content=CONFIG.prompts.llm.default_system(
-                phone_number=call.phone_number,
-            ),
-            role="system",
-        ),
-        ChatCompletionSystemMessageParam(
-            content=CONFIG.prompts.llm.chat_system(
-                call=call,
-                trainings=trainings,
-            ),
-            role="system",
-        ),
-    ]
-    for message in call.messages:
-        if message.persona == MessagePersona.HUMAN:
-            messages.append(
-                ChatCompletionUserMessageParam(
-                    content=f"action={message.action.value} style={message.style.value} {message.content}",
-                    role="user",
-                )
-            )
-        elif message.persona == MessagePersona.ASSISTANT:
-            if not message.tool_calls:
-                messages.append(
-                    ChatCompletionAssistantMessageParam(
-                        content=f"action={message.action.value} style={message.style.value} {message.content}",
-                        role="assistant",
-                    )
-                )
-            else:
-                messages.append(
-                    ChatCompletionAssistantMessageParam(
-                        content=f"action={message.action.value} style={message.style.value} {message.content}",
-                        role="assistant",
-                        tool_calls=[
-                            ChatCompletionMessageToolCallParam(
-                                id=tool_call.tool_id,
-                                type="function",
-                                function={
-                                    "arguments": tool_call.function_arguments,
-                                    "name": "-".join(
-                                        re.sub(
-                                            FUNC_NAME_SANITIZER_R,
-                                            "-",
-                                            tool_call.function_name,
-                                        ).split("-")
-                                    ),  # Sanitize with dashes then deduplicate dashes, backward compatibility with old models
-                                },
-                            )
-                            for tool_call in message.tool_calls
-                        ],
-                    )
-                )
-                for tool_call in message.tool_calls:
-                    messages.append(
-                        ChatCompletionToolMessageParam(
-                            content=tool_call.content,
-                            role="tool",
-                            tool_call_id=tool_call.tool_id,
-                        )
-                    )
-    _logger.debug(f"Messages: {messages}")
-
-    customer_response_prop = "customer_response"
-    tools: List[ChatCompletionToolParam] = [
-        ChatCompletionToolParam(
-            type="function",
-            function={
-                "description": "Use this if the user wants to talk to a human and Assistant is unable to help. This will transfer the customer to an human agent. Approval from the customer must be explicitely given. Never use this action directly after a recall. Example: 'I want to talk to a human', 'I want to talk to a real person'.",
-                "name": IndentAction.TALK_TO_HUMAN.value,
-                "parameters": {
-                    "properties": {},
-                    "required": [],
-                    "type": "object",
-                },
-            },
-        ),
-        ChatCompletionToolParam(
-            type="function",
-            function={
-                "description": "Use this if the user wants to end the call, or if the user said goodbye in the current call. Be warnging that the call will be ended immediately. Never use this action directly after a recall. Example: 'I want to hang up', 'Good bye, see you soon', 'We are done here', 'We will talk again later'.",
-                "name": IndentAction.END_CALL.value,
-                "parameters": {
-                    "properties": {},
-                    "required": [],
-                    "type": "object",
-                },
-            },
-        ),
-        ChatCompletionToolParam(
-            type="function",
-            function={
-                "description": "Use this if the user wants to create a new claim for a totally different subject. This will reset the claim and reminder data. Old is stored but not accessible anymore. Approval from the customer must be explicitely given. Example: 'I want to create a new claim'.",
-                "name": IndentAction.NEW_CLAIM.value,
-                "parameters": {
-                    "properties": {
-                        f"{customer_response_prop}": {
-                            "description": "The text to be read to the customer to confirm the update. Only speak about this action. Use an imperative sentence. Example: 'I am updating the involved parties to Marie-Jeanne and Jean-Pierre', 'I am updating the contact contact info to 123 rue de la paix 75000 Paris, +33735119775, only call after 6pm'.",
-                            "type": "string",
-                        }
-                    },
-                    "required": [
-                        customer_response_prop,
-                    ],
-                    "type": "object",
-                },
-            },
-        ),
-        ChatCompletionToolParam(
-            type="function",
-            function={
-                "description": "Use this if the user wants to update a claim field with a new value. Example: 'Update claim explanation to: I was driving on the highway when a car hit me from behind', 'Update contact contact info to: 123 rue de la paix 75000 Paris, +33735119775, only call after 6pm'.",
-                "name": IndentAction.UPDATED_CLAIM.value,
-                "parameters": {
-                    "properties": {
-                        "field": {
-                            "description": "The claim field to update.",
-                            "enum": list(ClaimModel.editable_fields()),
-                            "type": "string",
-                        },
-                        "value": {
-                            "description": "The claim field value to update. For dates, use YYYY-MM-DD HH:MM format (e.g. 2024-02-01 18:58). For phone numbers, use E164 format (e.g. +33612345678).",
-                            "type": "string",
-                        },
-                        f"{customer_response_prop}": {
-                            "description": "The text to be read to the customer to confirm the update. Only speak about this action. Use an imperative sentence. Example: 'I am updating the involved parties to Marie-Jeanne and Jean-Pierre', 'I am updating the contact contact info to 123 rue de la paix 75000 Paris, +33735119775, only call after 6pm'.",
-                            "type": "string",
-                        },
-                    },
-                    "required": [
-                        customer_response_prop,
-                        "field",
-                        "value",
-                    ],
-                    "type": "object",
-                },
-            },
-        ),
-        ChatCompletionToolParam(
-            type="function",
-            function={
-                "description": "Use this if you think there is something important to do in the future, and you want to be reminded about it. If it already exists, it will be updated with the new values. Example: 'Remind Assitant thuesday at 10am to call back the customer', 'Remind Assitant next week to send the report', 'Remind the customer next week to send the documents by the end of the month'.",
-                "name": IndentAction.NEW_OR_UPDATED_REMINDER.value,
-                "parameters": {
-                    "properties": {
-                        "description": {
-                            "description": "Contextual description of the reminder. Should be detailed enough to be understood by anyone. Example: 'Watch model is Rolex Submariner 116610LN', 'User said the witnesses car was red but the police report says it was blue. Double check with the involved parties'.",
-                            "type": "string",
-                        },
-                        "due_date_time": {
-                            "description": "Datetime when the reminder should be triggered. Should be in the future, in the ISO format.",
-                            "type": "string",
-                        },
-                        "title": {
-                            "description": "Short title of the reminder. Should be short and concise, in the format 'Verb + Subject'. Title is unique and allows the reminder to be updated. Example: 'Call back customer', 'Send analysis report', 'Study replacement estimates for the stolen watch'.",
-                            "type": "string",
-                        },
-                        "owner": {
-                            "description": "The owner of the reminder. Can be 'customer', 'assistant', or a third party from the claim. Try to be as specific as possible, with a name. Example: 'customer', 'assistant', 'contact', 'witness', 'police'.",
-                            "type": "string",
-                        },
-                        f"{customer_response_prop}": {
-                            "description": "The text to be read to the customer to confirm the reminder. Only speak about this action. Use an imperative sentence. Example: 'I am creating a reminder for next week to call back the customer', 'I am creating a reminder for next week to send the report'.",
-                            "type": "string",
-                        },
-                    },
-                    "required": [
-                        customer_response_prop,
-                        "description",
-                        "due_date_time",
-                        "title",
-                        "owner",
-                    ],
-                    "type": "object",
-                },
-            },
-        ),
-    ]
-    _logger.debug(f"Tools: {tools}")
+    function = CONFIG.prompts.llm.chat_system(kernel=kernel, call=call)
 
     full_content = ""
     buffer_content = ""
@@ -1090,7 +872,7 @@ async def llm_chat(
                 f'LLM send back invalid tool schema "multi_tool_use.parallel", retrying'
             )
             return await llm_chat(
-                background_tasks, call, user_callback, _retry_attempt + 1, trainings
+                background_tasks, call, user_callback, client, _retry_attempt + 1
             )
 
         # OpenAI GPT-4 Turbo tends to return empty content, in that case, retry within limits
@@ -1101,7 +883,11 @@ async def llm_chat(
                 return await _error_response()
             _logger.warn(f"LLM send back empty content, retrying")
             return await llm_chat(
-                background_tasks, call, user_callback, _retry_attempt + 1, trainings
+                background_tasks,
+                call,
+                user_callback,
+                client,
+                _retry_attempt + 1,
             )
 
         intent = IndentAction.CONTINUE
@@ -1267,81 +1053,6 @@ async def llm_chat(
     return await _error_response()
 
 
-async def handle_recognize_text(
-    client: CallConnectionClient,
-    call: CallModel,
-    style: MessageStyle = MessageStyle.NONE,
-    text: Optional[str] = None,
-    store: bool = True,
-) -> None:
-    """
-    Play a text to a call participant and start recognizing the response.
-
-    If `store` is `True`, the text will be stored in the call messages. Starts by playing text, then the "ready" sound, and finally starts recognizing the response.
-    """
-    if text:
-        await handle_play(
-            call=call,
-            client=client,
-            store=store,
-            style=style,
-            text=text,
-        )
-
-    await handle_recognize_media(
-        call=call,
-        client=client,
-        sound_url=CONFIG.prompts.sounds.ready(),
-    )
-
-
-# TODO: Disable or lower profanity filter. The filter seems enabled by default, it replaces words like "holes in my roof" by "*** in my roof". This is not acceptable for a call center.
-async def handle_recognize_media(
-    client: CallConnectionClient,
-    call: CallModel,
-    sound_url: str,
-) -> None:
-    """
-    Play a media to a call participant and start recognizing the response.
-    """
-    _logger.debug(f"Recognizing media ({call.call_id})")
-    try:
-        client.start_recognizing_media(
-            end_silence_timeout=3,  # Sometimes user includes breaks in their speech
-            input_type=RecognizeInputType.SPEECH,
-            play_prompt=FileSource(url=sound_url),
-            speech_language=call.lang.short_code,
-            target_participant=PhoneNumberIdentifier(call.phone_number),
-        )
-    except ResourceNotFoundError:
-        _logger.debug(f"Call hung up before recognizing ({call.call_id})")
-    except HttpResponseError as e:
-        if "call already terminated" in e.message.lower():
-            _logger.debug(f"Call hung up before playing ({call.call_id})")
-        else:
-            raise e
-
-
-async def handle_media(
-    client: CallConnectionClient,
-    call: CallModel,
-    sound_url: str,
-    context: Optional[str] = None,
-) -> None:
-    try:
-        client.play_media(
-            operation_context=context,
-            play_source=FileSource(url=sound_url),
-        )
-    except ResourceNotFoundError:
-        _logger.debug(f"Call hung up before playing ({call.call_id})")
-    except HttpResponseError as e:
-        if "call already terminated" in e.message.lower():
-            _logger.debug(f"Call hung up before playing ({call.call_id})")
-        else:
-            raise e
-
-
 async def handle_hangup(
     background_tasks: BackgroundTasks, client: CallConnectionClient, call: CallModel
 ) -> None:
@@ -1417,22 +1128,6 @@ async def post_call_sms(call: CallModel) -> None:
         )
 
 
-def audio_from_text(text: str, style: MessageStyle, call: CallModel) -> SsmlSource:
-    """
-    Generate an audio source that can be read by Azure Communication Services SDK.
-
-    Text requires to be SVG escaped, and SSML tags are used to control the voice. Plus, text is slowed down by 5% to make it more understandable for elderly people. Text is also truncated to 400 characters, as this is the limit of Azure Communication Services TTS, but a warning is logged.
-    """
-    # Azure Speech Service TTS limit is 400 characters
-    if len(text) > 400:
-        _logger.warning(
-            f"Text is too long to be processed by TTS, truncating to 400 characters, fix this!"
-        )
-        text = text[:400]
-    ssml = f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="{call.lang.short_code}"><voice name="{call.lang.voice}" effect="eq_telecomhp8k"><lexicon uri="{CONFIG.resources.public_url}/lexicon.xml"/><mstts:express-as style="{style.value}" styledegree="0.5"><prosody rate="0.95">{text}</prosody></mstts:express-as></voice></speak>'
-    return SsmlSource(ssml_text=ssml)
-
-
 async def callback_url(caller_id: str) -> str:
     """
     Generate the callback URL for a call.
@@ -1503,39 +1198,6 @@ async def post_call_next(call: CallModel) -> None:
     _logger.info(f"Next action ({call.call_id}): {next}")
     call.next = next
     await db.call_aset(call)
-
-
-def _sentence_split(text: str) -> Generator[str, None, None]:
-    """
-    Split a text into sentences.
-    """
-    separators = re.findall(SENTENCE_R, text)
-    splits = re.split(SENTENCE_R, text)
-    for i, separator in enumerate(separators):
-        local_content = splits[i] + separator
-        yield local_content
-
-
-async def handle_recognize_ivr(
-    client: CallConnectionClient,
-    call: CallModel,
-    text: str,
-    choices: List[RecognitionChoice],
-) -> None:
-    _logger.info(f"Playing text before IVR ({call.call_id}): {text}")
-    _logger.debug(f"Recognizing IVR ({call.call_id})")
-    try:
-        client.start_recognizing_media(
-            choices=choices,
-            end_silence_timeout=10,
-            input_type=RecognizeInputType.CHOICES,
-            interrupt_prompt=True,
-            play_prompt=audio_from_text(text, MessageStyle.NONE, call),
-            speech_language=call.lang.short_code,
-            target_participant=PhoneNumberIdentifier(call.phone_number),
-        )
-    except ResourceNotFoundError:
-        _logger.debug(f"Call hung up before recognizing ({call.call_id})")
 
 
 async def handle_ivr_language(

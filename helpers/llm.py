@@ -11,31 +11,68 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from helpers.config import CONFIG
 from contextlib import asynccontextmanager
 from helpers.logging import build_logger
-from openai import (
-    AsyncAzureOpenAI,
-    AsyncStream,
-    RateLimitError,
-)
-from openai.types.chat import (
-    ChatCompletionChunk,
-    ChatCompletionMessageParam,
-    ChatCompletionToolParam,
-)
-from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from pydantic import BaseModel, ValidationError
 from tenacity import (
+    retry_if_exception_type,
     retry,
     stop_after_attempt,
     wait_random_exponential,
-    retry_if_exception_type,
 )
-from typing import AsyncGenerator, List, Optional, Type, TypeVar
-import asyncio
+from typing import (
+    AsyncGenerator,
+    AsyncIterable,
+    Callable,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+)
+from semantic_kernel import (
+    Kernel,
+    ContextVariables,
+)
+from semantic_kernel.connectors.ai.open_ai.prompt_execution_settings.azure_chat_prompt_execution_settings import (
+    AzureChatPromptExecutionSettings,
+)
+from semantic_kernel.connectors.ai.open_ai import AzureChatCompletion
+from semantic_kernel.core_plugins.math_plugin import MathPlugin
+from semantic_kernel.core_plugins.time_plugin import TimePlugin
+from semantic_kernel.core_plugins.conversation_summary_plugin import (
+    ConversationSummaryPlugin,
+)
+from sk_plugins.call import CallPlugin
+from sk_plugins.claim import ClaimPlugin
+from sk_plugins.reminder import ReminderPlugin
+from azure.communication.callautomation import CallConnectionClient
+from models.call import CallModel
+from semantic_kernel.orchestration.kernel_function import KernelFunction
+from models.message import MessageModel
+from fastapi import BackgroundTasks
 
 
 _logger = build_logger(__name__)
 _logger.info(f"Using OpenAI GPT model {CONFIG.openai.gpt_model}")
 _logger.info(f"Using Content Safety {CONFIG.content_safety.endpoint}")
+
+_oai_config = {
+    # Azure deployment
+    "ai_model_id": CONFIG.openai.gpt_model,
+    "api_version": "2023-12-01-preview",
+    "deployment_name": CONFIG.openai.gpt_deployment,
+    "endpoint": CONFIG.openai.endpoint,
+    # Authentication, either RBAC or API key
+    "api_key": (
+        CONFIG.openai.api_key.get_secret_value() if CONFIG.openai.api_key else None
+    ),
+    "ad_token_provider": (
+        get_bearer_token_provider(
+            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+        )
+        if not CONFIG.openai.api_key
+        else None
+    ),
+}
+_chat = AzureChatCompletion(**_oai_config)
 
 ModelType = TypeVar("ModelType", bound=BaseModel)
 
@@ -51,52 +88,47 @@ class SafetyCheckError(Exception):
         return self.message
 
 
-@retry(
-    reraise=True,
-    retry=retry_if_exception_type(RateLimitError),
-    stop=stop_after_attempt(3),
-    wait=wait_random_exponential(multiplier=0.5, max=30),
-)
 async def completion_stream(
-    messages: List[ChatCompletionMessageParam],
+    messages: List[MessageModel],
+    function: KernelFunction,
+    context: dict[str, str],
     max_tokens: int,
-    tools: Optional[List[ChatCompletionToolParam]] = None,
-) -> AsyncGenerator[ChoiceDelta, None]:
+) -> AsyncGenerator[str, None]:
     """
     Returns a stream of completion results.
 
     Catch errors for a maximum of 3 times (internal + `RateLimitError`), then raise the error.
     """
-    extra = {}
+    # Config
+    settings = AzureChatPromptExecutionSettings(
+        max_tokens=max_tokens,
+        temperature=0,  # Most focused and deterministic
+    )  # type: ignore
+    variables = ContextVariables(variables=context)
 
-    if tools:
-        extra["tools"] = tools
+    _populate_messages(
+        function=function,
+        messages=messages,
+    )
 
-    async with _use_oai() as client:
-        stream: AsyncStream[ChatCompletionChunk] = await client.chat.completions.create(
-            max_tokens=max_tokens,
-            messages=messages,
-            model=CONFIG.openai.gpt_model,
-            stream=True,
-            temperature=0,  # Most focused and deterministic
-            **extra,
-        )
-        async for chunck in stream:
-            if chunck.choices:  # Skip empty chunks, happens with GPT-4 Turbo
-                yield chunck.choices[0].delta
+    # Run
+    stream: AsyncIterable[str] = function.invoke_stream(
+        variables=variables, settings=settings
+    )
+    async for chunck in stream:
+        yield chunck
 
 
 @retry(
     reraise=True,
-    retry=(
-        retry_if_exception_type(SafetyCheckError)
-        | retry_if_exception_type(RateLimitError)
-    ),
+    retry=retry_if_exception_type(SafetyCheckError),
     stop=stop_after_attempt(3),
     wait=wait_random_exponential(multiplier=0.5, max=30),
 )
 async def completion_sync(
-    messages: List[ChatCompletionMessageParam],
+    messages: List[MessageModel],
+    function: KernelFunction,
+    context: dict[str, str],
     max_tokens: int,
     json_output: bool = False,
 ) -> Optional[str]:
@@ -105,27 +137,29 @@ async def completion_sync(
 
     Catch errors for a maximum of 3 times (internal + `RateLimitError` + `SafetyCheckError`), then raise the error. Safety check is only performed for text responses (= not JSON).
     """
-    extra = {}
+    # Config
+    settings = AzureChatPromptExecutionSettings(
+        max_tokens=max_tokens,
+        response_format="json_object" if json_output else "text",
+        temperature=0,  # Most focused and deterministic
+    )  # type: ignore
+    variables = ContextVariables(variables=context)
 
-    if json_output:
-        extra["response_format"] = {"type": "json_object"}
+    _populate_messages(
+        function=function,
+        messages=messages,
+    )
 
-    content = None
-    async with _use_oai() as client:
-        res = await client.chat.completions.create(
-            max_tokens=max_tokens,
-            messages=messages,
-            model=CONFIG.openai.gpt_model,
-            temperature=0,  # Most focused and deterministic
-            **extra,
-        )
-        content = res.choices[0].message.content
+    # Run
+    res = await function.invoke(variables=variables, settings=settings)
+    content = res.result
 
+    # Safety check
     if not content:
         return None
-
     if not json_output:
         await safety_check(content)
+
     return content
 
 
@@ -136,7 +170,9 @@ async def completion_sync(
     wait=wait_random_exponential(multiplier=0.5, max=30),
 )
 async def completion_model_sync(
-    messages: List[ChatCompletionMessageParam],
+    messages: List[MessageModel],
+    function: KernelFunction,
+    context: dict[str, str],
     max_tokens: int,
     model: Type[ModelType],
 ) -> Optional[ModelType]:
@@ -145,7 +181,13 @@ async def completion_model_sync(
 
     Catch errors for a maximum of 3 times, but not `SafetyCheckError`.
     """
-    res = await completion_sync(messages, max_tokens, json_output=True)
+    res = await completion_sync(
+        context=context,
+        function=function,
+        json_output=True,
+        max_tokens=max_tokens,
+        messages=messages,
+    )
     if not res:
         return None
     return model.model_validate_json(res)
@@ -243,32 +285,6 @@ def _contentsafety_category_test(
 
 
 @asynccontextmanager
-async def _use_oai() -> AsyncGenerator[AsyncAzureOpenAI, None]:
-    client = AsyncAzureOpenAI(
-        # Reliability
-        max_retries=3,
-        timeout=60,
-        # Azure deployment
-        api_version="2023-12-01-preview",
-        azure_deployment=CONFIG.openai.gpt_deployment,
-        azure_endpoint=CONFIG.openai.endpoint,
-        # Authentication, either RBAC or API key
-        api_key=(
-            CONFIG.openai.api_key.get_secret_value() if CONFIG.openai.api_key else None
-        ),
-        azure_ad_token_provider=(
-            get_bearer_token_provider(
-                DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
-            )
-            if not CONFIG.openai.api_key
-            else None
-        ),
-    )
-    yield client
-    await client.close()
-
-
-@asynccontextmanager
 async def _use_contentsafety() -> AsyncGenerator[ContentSafetyClient, None]:
     client = ContentSafetyClient(
         # Azure deployment
@@ -280,3 +296,27 @@ async def _use_contentsafety() -> AsyncGenerator[ContentSafetyClient, None]:
     )
     yield client
     await client.close()
+
+
+def _populate_messages(function: KernelFunction, messages: List[MessageModel]) -> None:
+    """
+    Populate messages to the function.
+    """
+    for message_model in messages:
+        messages_openai = message_model.to_openai()
+        for message_openai in messages_openai:
+            function.chat_prompt_template.add_message(**message_openai)  # type: ignore
+
+
+def build_kernel() -> Kernel:
+    kernel = Kernel()
+
+    # Link LLM
+    kernel.add_chat_service("openai", _chat)
+
+    # Import core plugins
+    kernel.import_plugin(ConversationSummaryPlugin(kernel), "ConversationSummary")
+    kernel.import_plugin(MathPlugin(), "Math")
+    kernel.import_plugin(TimePlugin(), "Time")
+
+    return kernel

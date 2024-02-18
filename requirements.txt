@@ -12,12 +12,12 @@ email-validator==2.1.0.post1  # Required for pydantic
 fastapi==0.109.2
 jinja2==3.1.3
 mistune==3.0.2
-openai==1.12.0
 phonenumbers==8.13.30  # Required for pydantic-extra-types
 pydantic-extra-types==2.5.0  # Required for pydantic
 pydantic-settings==2.1.0
-python-dotenv==1.0.1
+python-dotenv==1.0.0
 pyyaml==6.0.1
 redis==5.0.1
+semantic-kernel==0.5.1.dev0
 tenacity==8.2.3
 uvicorn==0.25.0
