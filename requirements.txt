@@ -13,7 +13,7 @@ fastapi==0.110.0
 jinja2==3.1.3
 json-repair==0.10.1
 mistune==3.0.2
-openai==1.14.2
+openai==1.14.3
 opentelemetry-instrumentation-aiohttp-client==0.44b0
 opentelemetry-instrumentation-fastapi==0.44b0
 opentelemetry-instrumentation-httpx==0.44b0
