@@ -56,7 +56,7 @@ jobs:
           submodules: recursive
 
       - name: SAST - Credentials
-        uses: trufflesecurity/trufflehog@v3.71.0
+        uses: trufflesecurity/trufflehog@v3.71.2
         with:
           base: ${{ github.event.repository.default_branch }}
           extra_args: --only-verified
