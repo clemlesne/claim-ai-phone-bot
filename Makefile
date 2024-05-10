@@ -1,11 +1,11 @@
 # Container configuration
-container_name := ghcr.io/clemlesne/claim-ai-phone-bot
+container_name := ghcr.io/clemlesne/call-center-ai
 docker := docker
 # Versioning
 version_full ?= $(shell $(MAKE) --silent version-full)
 version_small ?= $(shell $(MAKE) --silent version)
 # DevTunnel configuration
-tunnel_name := claim-ai-$(shell hostname | sed 's/[^a-zA-Z0-9]//g' | tr '[:upper:]' '[:lower:]')
+tunnel_name := call-center-ai-$(shell hostname | sed 's/[^a-zA-Z0-9]//g' | tr '[:upper:]' '[:lower:]')
 tunnel_url ?= $(shell res=$$(devtunnel show $(tunnel_name) | grep -o 'http[s]*://[^"]*' | xargs) && echo $${res%/})
 # App location
 app_location := westeurope
@@ -116,14 +116,14 @@ start:
 		--env VERSION=$(version_full) \
 		--mount type=bind,source="$(CURDIR)/.env",target="/app/.env" \
 		--mount type=bind,source="$(CURDIR)/config.yaml",target="/app/config.yaml" \
-		--name claim-ai \
+		--name call-center-ai \
 		--publish 8080:8080 \
 		--rm \
 		$(container_name):$(version_small)
 
 stop:
 	@echo "Stopping container..."
-	$(docker) stop claim-ai
+	$(docker) stop call-center-ai
 
 deploy:
 	@echo "🛠️ Deploying to Azure..."

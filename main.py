@@ -4,7 +4,7 @@ from helpers.config import CONFIG
 
 
 _logger = build_logger(__name__)
-_logger.info(f"claim-ai v{CONFIG.version}")
+_logger.info(f"call-center-ai v{CONFIG.version}")
 
 
 # General imports
@@ -79,15 +79,15 @@ _sms = CONFIG.sms.instance()
 _logger.info(f'Using root path "{CONFIG.api.root_path}"')
 api = FastAPI(
     contact={
-        "url": "https://github.com/clemlesne/claim-ai-phone-bot",
+        "url": "https://github.com/clemlesne/call-center-ai",
     },
     description="AI-powered call center solution with Azure and OpenAI GPT.",
     license_info={
         "name": "Apache-2.0",
-        "url": "https://github.com/clemlesne/claim-ai-phone-bot/blob/master/LICENCE",
+        "url": "https://github.com/clemlesne/call-center-ai/blob/master/LICENCE",
     },
     root_path=CONFIG.api.root_path,
-    title="claim-ai-phone-bot",
+    title="call-center-ai",
     version=CONFIG.version,
 )
 

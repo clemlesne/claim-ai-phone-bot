@@ -23,10 +23,10 @@ output communicationId string = app.outputs.communicationId
 output logAnalyticsWorkspaceCustomerId string = app.outputs.logAnalyticsWorkspaceCustomerId
 
 var tags = {
-  application: 'claim-ai'
+  application: 'call-center-ai'
   instance: instance
   managed_by: 'Bicep'
-  sources: 'https://github.com/clemlesne/claim-ai-phone-bot'
+  sources: 'https://github.com/clemlesne/call-center-ai'
   version: imageVersion
 }
 

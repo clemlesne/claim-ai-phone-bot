@@ -1,10 +1,10 @@
-# Call center claim AI phone bot
+# Call Center AI
 
 AI-powered call center solution with Azure and OpenAI GPT.
 
 <!-- github.com badges -->
-[![Last release date](https://img.shields.io/github/release-date/clemlesne/claim-ai-phone-bot)](https://github.com/clemlesne/claim-ai-phone-bot/releases)
-[![Project license](https://img.shields.io/github/license/clemlesne/claim-ai-phone-bot)](https://github.com/clemlesne/claim-ai-phone-bot/blob/main/LICENSE)
+[![Last release date](https://img.shields.io/github/release-date/clemlesne/call-center-ai)](https://github.com/clemlesne/call-center-ai/releases)
+[![Project license](https://img.shields.io/github/license/clemlesne/call-center-ai)](https://github.com/clemlesne/call-center-ai/blob/main/LICENSE)
 
 ## Overview
 
@@ -207,8 +207,8 @@ sequenceDiagram
 
 Container is available on GitHub Actions, at:
 
-- Latest version from a branch: `ghcr.io/clemlesne/claim-ai-phone-bot:main`
-- Specific tag: `ghcr.io/clemlesne/claim-ai-phone-bot:0.1.0` (recommended)
+- Latest version from a branch: `ghcr.io/clemlesne/call-center-ai:main`
+- Specific tag: `ghcr.io/clemlesne/call-center-ai:0.1.0` (recommended)
 
 Create a local `config.yaml` file (most of the fields are filled automatically by the deployment script):
 

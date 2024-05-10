@@ -21,7 +21,7 @@ AioHttpClientInstrumentor().instrument()  # Instrument aiohttp
 HTTPXClientInstrumentor().instrument()  # Instrument httpx
 TRACER = trace.get_tracer(
     instrumenting_library_version=CONFIG.version,
-    instrumenting_module_name="com.github.clemlesne.claim-ai",
+    instrumenting_module_name="com.github.clemlesne.call-center-ai",
 )  # Create a tracer that will be used in the app
 
 
