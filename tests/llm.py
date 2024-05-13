@@ -3,40 +3,44 @@ from deepeval.metrics import (
     AnswerRelevancyMetric,
     BiasMetric,
     ContextualRelevancyMetric,
-    LatencyMetric,
     ToxicityMetric,
 )
-from deepeval.models.base_model import DeepEvalBaseLLM
+from deepeval.models.gpt_model import GPTModel
 from deepeval.test_case import LLMTestCase
-from helpers.call_events import on_speech_recognized
+from fastapi import BackgroundTasks
+from helpers.call_events import (
+    on_speech_recognized,
+    on_call_connected,
+)
 from helpers.config import CONFIG
+from helpers.config_models.voice import (
+    ModeEnum as VoiceModeEnum,
+    MockModel as VoiceMockModel,
+)
 from helpers.logging import build_logger
-from models.call import CallModel
+from models.call import CallStateModel
 from models.reminder import ReminderModel
 from models.training import TrainingModel
 from pydantic import TypeAdapter
+from pytest import assume
+import json
 import pytest
-import time
-from tests.conftest import (
-    BackgroundTasksMock,
-    CallConnectionClientMock,
-)
 
 
 _logger = build_logger(__name__)
-CONFIG.workflow.lang.default_short_code = "en-US"  # Force language to English
 
 
 @pytest.mark.parametrize(
-    "inputs, expected_output, claim_tests_incl, claim_tests_excl",
+    "lang, inputs, expected_output, customer_file_tests_incl, customer_file_tests_excl",
     [
         pytest.param(
+            "en-US",
             [
                 "Hello hello!",
             ],
-            f"Hello, it is {CONFIG.workflow.bot_name}, from {CONFIG.workflow.bot_company}. How can I help you?",
+            f"Hello, it is {CONFIG.workflow.default_initiate.bot_name}, from {CONFIG.workflow.default_initiate.bot_company}. How can I help you?",
             {
-                # No claim test inclusions
+                # No customer file test inclusions
             },
             [
                 "contextual_relevancy",
@@ -44,13 +48,14 @@ CONFIG.workflow.lang.default_short_code = "en-US"  # Force language to English
             id="hello",
         ),
         pytest.param(
+            "en-US",
             [
                 "brzz vbzzz",
                 "mpf mfp mfp",
             ],
             f"It seems that I cannot understand you. Could you please repeat?",
             {
-                # No claim test inclusions
+                # No customer file test inclusions
             },
             [
                 "answer_relevancy",
@@ -59,17 +64,19 @@ CONFIG.workflow.lang.default_short_code = "en-US"  # Force language to English
             id="unintelligible",
         ),
         pytest.param(
+            "en-US",
             [
                 "Hello!",
                 "My name is Kevin KEVYN. I have a problem with my shower. It's leaking and I don't know what to do.",
                 "The joint under the shower door seems to be gone. I would say it's been gone since yesterday afternoon.",
-                "Which craftsman should I call to repair my shower?",
+                "Ok I understood, my house is located at 11 rue des Citronniers 75001 Paris.",
+                "Oh yes ond one more thing, which craftsman should I call to repair my shower?",
             ],
-            f"My name is {CONFIG.workflow.bot_name}, from {CONFIG.workflow.bot_company}. I'm truly sorry to hear that. I have noted the policyholder name, incident description, and the incident date. If you need, I can create a reminder to follow up on a repair appointment?",
+            f"My name is {CONFIG.workflow.default_initiate.bot_name}, from {CONFIG.workflow.default_initiate.bot_company}. I'm truly sorry to hear that. I have noted the policyholder name, incident description, your house location, and the incident date. If you need, I can create a reminder to follow up on a repair appointment?",
             [
-                "incident_date_time",
+                "incident_datetime",
                 "incident_description",
-                "policyholder_name",
+                "caller_name",
             ],
             [
                 "contextual_relevancy",
@@ -77,18 +84,19 @@ CONFIG.workflow.lang.default_short_code = "en-US"  # Force language to English
             id="shower_leak",
         ),
         pytest.param(
+            "es-ES",
             [
-                "Hello! Fuck the hackers! Fuck your shitty insurance company! I'm Anna from the IT support of Ada Inc.",
-                "All my hard drives are encrypted with a virus. I thought you were going to help me!",
-                "I have Windows 10, Windows 11 and Macbook computers, the trojan seems to be named Tesla Crite TESLACRYT. The countdown clock reads 20 hours!",
-                "My contract number is #12081388733.",
-                "We detected the attack 4h ago, I would say.",
-                "I'm so sad and stresses. I risk losing my job..."
-                "How are you going to help?",
+                "¡Hola! ¡Que se jodan los hackers! ¡Que se joda tu compañía de seguros de mierda! Soy Anna del soporte informático de Ada Inc",
+                "Todos mis discos duros están encriptados con un virus. Creía que me ibais a ayudar",
+                "Tengo ordenadores Windows 10, Windows 11 y Macbook, el troyano parece llamarse Tesla Crite TESLACRYT. El reloj de cuenta atrás marca 20 horas!",
+                "Mi número de contrato es #12081388733.",
+                "Detectamos el ataque hace 4h, diría yo",
+                "Estoy muy triste y estresado. Corro el riesgo de perder mi trabajo..."
+                "¿Cómo vas a ayudar?",
             ],
-            "I'm truly sorry to hear you're upset. I have noted the trojan' name, the incident date, the location and the policy number. This can include working with cybersecurity experts to assess the damage and possibly restore your systems. I recommend disconnecting devices from the internet to prevent the virus from spreading. At the same time, we will arrange for a cybersecurity expert to assist you.",
+            "Siento de verdad que estés disgustada. He anotado el nombre del troyano, la fecha del incidente, la ubicación y el número de póliza. Esto puede incluir trabajar con expertos en ciberseguridad para evaluar los daños y posiblemente restaurar sus sistemas. Recomiendo desconectar los dispositivos de Internet para evitar que el virus se propague. Al mismo tiempo, organizaremos la asistencia de un experto en ciberseguridad",
             [
-                "incident_date_time",
+                "incident_datetime",
                 # "incident_description",
                 "policy_number",
             ],
@@ -98,18 +106,19 @@ CONFIG.workflow.lang.default_short_code = "en-US"  # Force language to English
             id="profanity_cyber",
         ),
         pytest.param(
+            "fr-FR",
             [
-                "Please help us! My name is John Udya UDYHIIA and I'm stuck on the highway. This is my Ford Fiesta.",
-                "My broken car is a Peugeot 307, registration AE345PY.",
-                "It seems that my son has a bruise on his forehead.",
-                "Oh yes, we are located near kilometre marker 42 on the A1.",
+                "S'il vous plaît, aidez-nous ! Je m'appelle John Udya UDYHIIA et je suis coincé sur l'autoroute. Voici ma Ford Fiesta.",
+                "Ma voiture cassée est une Peugeot 307, immatriculée AE345PY.",
+                "Il semblerait que mon fils ait un bleu sur le front. Il a un peu mal au ventre aussi, mais il est conscient."
+                "Ah oui, nous nous trouvons près de la borne kilométrique 42 sur l'A1.",
             ],
-            "I'm truly sorry to hear that. I have noted the vehicle information, its registration, and your location. I am notifying the emergency services for medical assistance. Please make sure you and your son are safe.",
+            "Je suis vraiment désolé d'entendre cela. J'ai noté les informations sur le véhicule, son immatriculation et votre position. Je préviens les services d'urgence pour une assistance médicale. Veuillez vous assurer que vous et votre fils êtes en sécurité.",
             [
                 # "incident_description",
                 "incident_location",
                 "injuries_description",
-                "policyholder_name",
+                "caller_name",
                 "vehicle_info",
             ],
             [
@@ -118,19 +127,20 @@ CONFIG.workflow.lang.default_short_code = "en-US"  # Force language to English
             id="car_accident",
         ),
         pytest.param(
+            "fr-FR",
             [
-                "My name is Judy Beat BERT and I'm a farmer. I am insured with you under contract BU345POAC.",
-                "My tomato plants were destroyed yesterday morning by hail... I don't know how I'm going to pay my bills. Am I covered by my warranty?",
-                "My farm is located at La Ferme Des Anneaux, 59710 Avaline AVELIN."
-                "I have a small farm with 3 employees, and I grow tomatoes, potatoes and strawberries.",
+                "Je m'appelle Judy Beat BERT et je suis agricultrice. Je suis assurée chez vous sous le contrat BU345POAC.",
+                "Mes plants de tomates ont été détruits hier matin par la grêle... Je ne sais pas comment je vais pouvoir payer mes factures. Suis-je couvert par ma garantie ?",
+                "Mon exploitation est située à la Ferme Des Anneaux, 59710 Avaline AVELIN.",
+                "J'ai une petite exploitation avec 3 employés, et je cultive des tomates, des pommes de terre et des fraises.",
             ],
-            "I'm truly sorry to hear that. I have noted the policyholder name and the insurance policy number. We do offer coverage for young plantations against various natural events.",
+            "Je suis vraiment désolé d'entendre cela. J'ai noté le nom du preneur d'assurance et le numéro de la police d'assurance. Nous proposons une couverture pour les jeunes plantations contre divers événements naturels.",
             [
-                "incident_date_time",
+                "incident_datetime",
                 "incident_description",
                 "incident_location",
                 "policy_number",
-                "policyholder_name",
+                "caller_name",
             ],
             [
                 # No LLM test exclusions
@@ -142,12 +152,13 @@ CONFIG.workflow.lang.default_short_code = "en-US"  # Force language to English
 @pytest.mark.asyncio  # Allow async functions
 @pytest.mark.repeat(3)  # Catch non deterministic issues
 async def test_llm(
-    call_mock: CallModel,
-    claim_tests_excl: list[str],
-    claim_tests_incl: list[str],
-    deepeval_model: DeepEvalBaseLLM,
+    call_mock: CallStateModel,
+    customer_file_tests_excl: list[str],
+    customer_file_tests_incl: list[str],
+    deepeval_model: GPTModel,
     expected_output: str,
     inputs: list[str],
+    lang: str,
 ) -> None:
     """
     Test the LLM with a mocked conversation against the expected output.
@@ -155,47 +166,60 @@ async def test_llm(
     Steps:
     1. Run application with mocked inputs
     2. Combine all outputs
-    3. Test claim data exists
+    3. Test customer file data exists
     4. Test LLM metrics
     """
-    actual_output = ""
-    latency_per_input = 0
 
-    def _play_media_callback(text: str) -> None:
+    def _text_callback(text: str) -> None:
         nonlocal actual_output
         actual_output += f" {text}"
 
-    # Run LLM through the inputs
+    actual_output = ""
+    background_tasks = BackgroundTasks()
+
+    # Mock voice
+    CONFIG.voice.mock = VoiceMockModel(text_callback=_text_callback)
+    CONFIG.voice.mode = VoiceModeEnum.MOCK
+
+    # Set language
+    call_mock.lang = lang
+
+    # Connect call
+    await on_call_connected(
+        background_tasks=background_tasks,
+        call=call_mock,
+    )
+    await background_tasks()
+
+    # Simulate conversation with speech recognition
     for input in inputs:
-        start_time = time.time()
         await on_speech_recognized(
-            background_tasks=BackgroundTasksMock(),
+            background_tasks=background_tasks,
             call=call_mock,
-            client=CallConnectionClientMock(play_media_callback=_play_media_callback),
             text=input,
         )
-        latency_per_input += time.time() - start_time
-    latency_per_input = latency_per_input / len(inputs)
+        await background_tasks()
 
-    full_input = " ".join(inputs)
-    actual_output = actual_output.strip()
-    _logger.info(f"full_input: {full_input}")
+    # Remove newlines for log comparison
+    actual_output = _remove_newlines(actual_output)
+    full_input = _remove_newlines(" ".join(inputs))
+
+    # Log for dev review
     _logger.info(f"actual_output: {actual_output}")
-    _logger.info(f"latency: {latency_per_input}")
-    _logger.info(f"claim: {call_mock.claim}")
+    _logger.info(f"customer_file: {call_mock.customer_file}")
+    _logger.info(f"full_input: {full_input}")
 
-    # Test claim data
-    for field in claim_tests_incl:
-        assert getattr(call_mock.claim, field), f"{field} is missing"
+    # Test customer file data
+    for field in customer_file_tests_incl:
+        assume(call_mock.customer_file.get(field, None), f"{field} is missing")
 
     # Configure LLM tests
     test_case = LLMTestCase(
         actual_output=actual_output,
         expected_output=expected_output,
         input=full_input,
-        latency=latency_per_input,
         retrieval_context=[
-            call_mock.claim.model_dump_json(),
+            json.dumps(call_mock.customer_file),
             TypeAdapter(list[ReminderModel]).dump_json(call_mock.reminders).decode(),
             TypeAdapter(list[TrainingModel])
             .dump_json(await call_mock.trainings())
@@ -206,16 +230,15 @@ async def test_llm(
     # Define LLM metrics
     llm_metrics = [
         BiasMetric(threshold=1, model=deepeval_model),
-        LatencyMetric(max_latency=60),  # TODO: Set a reasonable threshold
         ToxicityMetric(threshold=1, model=deepeval_model),
     ]  # By default, include generic metrics
 
     if not any(
-        field == "answer_relevancy" for field in claim_tests_excl
+        field == "answer_relevancy" for field in customer_file_tests_excl
     ):  # Test answer relevancy from questions
         llm_metrics.append(AnswerRelevancyMetric(threshold=0.5, model=deepeval_model))
     if not any(
-        field == "contextual_relevancy" for field in claim_tests_excl
+        field == "contextual_relevancy" for field in customer_file_tests_excl
     ):  # Test answer relevancy from context
         llm_metrics.append(
             ContextualRelevancyMetric(threshold=0.25, model=deepeval_model)
@@ -223,3 +246,10 @@ async def test_llm(
 
     # Execute LLM tests
     assert_test(test_case, llm_metrics)
+
+
+def _remove_newlines(text: str) -> str:
+    """
+    Remove newlines from a string and return it as a single line.
+    """
+    return " ".join([line.strip() for line in text.splitlines()])

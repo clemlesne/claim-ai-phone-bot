@@ -1,10 +1,9 @@
 from typing import Awaitable, Callable, Optional, Tuple, Type
-from azure.communication.callautomation import (
-    CallConnectionClient,
-)
+
+from pydantic import ValidationError
 from helpers.config import CONFIG
 from helpers.logging import build_logger
-from models.call import CallModel
+from models.call import CallStateModel
 from models.message import (
     extract_message_style,
     MessageModel,
@@ -12,12 +11,6 @@ from models.message import (
     remove_message_action,
     StyleEnum as MessageStyleEnum,
     ToolModel as MessageToolModel,
-)
-from helpers.call_utils import (
-    handle_media,
-    handle_play,
-    handle_recognize_text,
-    tts_sentence_split,
 )
 from fastapi import BackgroundTasks
 from helpers.llm_tools import LlmPlugins
@@ -38,7 +31,7 @@ _logger = build_logger(__name__)
 _db = CONFIG.database.instance()
 
 
-async def llm_completion(text: Optional[str], call: CallModel) -> Optional[str]:
+async def llm_completion(text: Optional[str], call: CallStateModel) -> Optional[str]:
     """
     Run LLM completion from a system prompt and a Call model.
 
@@ -67,7 +60,7 @@ async def llm_completion(text: Optional[str], call: CallModel) -> Optional[str]:
 
 
 async def llm_model(
-    text: Optional[str], call: CallModel, model: Type[ModelType]
+    text: Optional[str], call: CallStateModel, model: Type[ModelType]
 ) -> Optional[ModelType]:
     """
     Run LLM completion from a system prompt, a Call model, and an expected model type as a return.
@@ -91,18 +84,18 @@ async def llm_model(
         )
     except APIError as e:
         _logger.warning(f"OpenAI API call error: {e}")
+    except ValidationError as e:
+        _logger.debug(f"Parsing error: {e.errors()}")
 
     return res
 
 
 def _llm_completion_system(
-    system: str, call: CallModel
+    system: str, call: CallStateModel
 ) -> list[ChatCompletionSystemMessageParam]:
     messages = [
         ChatCompletionSystemMessageParam(
-            content=CONFIG.prompts.llm.default_system(
-                phone_number=call.phone_number,
-            ),
+            content=CONFIG.prompts.llm.default_system(call=call),
             role="system",
         ),
         ChatCompletionSystemMessageParam(
@@ -116,11 +109,10 @@ def _llm_completion_system(
 
 async def load_llm_chat(
     background_tasks: BackgroundTasks,
-    call: CallModel,
-    client: CallConnectionClient,
-    post_call_intelligence: Callable[[CallModel, BackgroundTasks], None],
+    call: CallStateModel,
+    post_call_intelligence: Callable[[CallStateModel, BackgroundTasks], None],
     _iterations_remaining: int = 3,
-) -> CallModel:
+) -> CallStateModel:
     """
     Handle the intelligence of the call, including: LLM chat, TTS, and media play.
 
@@ -129,8 +121,8 @@ async def load_llm_chat(
     Returns the updated call model.
     """
     _logger.info("Loading LLM chat")
-
     should_play_sound = True
+    voice = CONFIG.voice.instance()
 
     async def _user_callback(text: str, style: MessageStyleEnum) -> None:
         """
@@ -145,9 +137,9 @@ async def load_llm_chat(
             return
 
         should_play_sound = False
-        await handle_play(
+        await voice.aplay_text(
+            background_tasks=background_tasks,
             call=call,
-            client=client,
             store=False,
             style=style,
             text=text,
@@ -157,7 +149,6 @@ async def load_llm_chat(
         _execute_llm_chat(
             background_tasks=background_tasks,
             call=call,
-            client=client,
             post_call_intelligence=post_call_intelligence,
             use_tools=_iterations_remaining > 0,
             user_callback=_user_callback,
@@ -184,8 +175,6 @@ async def load_llm_chat(
                 hard_timeout_task.cancel()
                 # Store updated chat model
                 is_error, continue_chat, should_user_answer, call = chat_task.result()
-                # Save in DB for new claims and allowing demos to be more "real-time"
-                await _db.call_aset(call)
                 break
 
             if hard_timeout_task.done():  # Break when hard timeout is reached
@@ -205,18 +194,18 @@ async def load_llm_chat(
                         f"Soft timeout of {CONFIG.workflow.intelligence_soft_timeout_sec}s reached"
                     )
                     soft_timeout_triggered = True
-                    await handle_play(
+                    await voice.aplay_text(
+                        background_tasks=background_tasks,
                         call=call,
-                        client=client,
-                        text=await CONFIG.prompts.tts.timeout_loading(call),
                         store=False,  # Do not store timeout prompt as it perturbs the LLM and makes it hallucinate
+                        text=await CONFIG.prompts.tts.timeout_loading(call),
                     )
 
                 else:  # Do not play timeout prompt plus loading, it can be frustrating for the user
-                    await handle_media(
+                    await voice.aplay_audio(
+                        background_tasks=background_tasks,
                         call=call,
-                        client=client,
-                        sound_url=CONFIG.prompts.sounds.loading(),
+                        url=CONFIG.prompts.sounds.loading(),
                     )  # Play loading sound
 
             # Wait to not block the event loop and play too many sounds
@@ -245,7 +234,6 @@ async def load_llm_chat(
             return await load_llm_chat(
                 background_tasks=background_tasks,
                 call=call,
-                client=client,
                 post_call_intelligence=post_call_intelligence,
                 _iterations_remaining=_iterations_remaining - 1,
             )
@@ -255,15 +243,14 @@ async def load_llm_chat(
         return await load_llm_chat(
             background_tasks=background_tasks,
             call=call,
-            client=client,
             post_call_intelligence=post_call_intelligence,
             _iterations_remaining=_iterations_remaining - 1,
         )
 
     if should_user_answer:
-        await handle_recognize_text(
+        await voice.arecognize_speech(
+            background_tasks=background_tasks,
             call=call,
-            client=client,
         )
 
     return call
@@ -271,12 +258,11 @@ async def load_llm_chat(
 
 async def _execute_llm_chat(
     background_tasks: BackgroundTasks,
-    call: CallModel,
-    client: CallConnectionClient,
-    post_call_intelligence: Callable[[CallModel, BackgroundTasks], None],
+    call: CallStateModel,
+    post_call_intelligence: Callable[[CallStateModel, BackgroundTasks], None],
     use_tools: bool,
     user_callback: Callable[[str, MessageStyleEnum], Awaitable],
-) -> Tuple[bool, bool, bool, CallModel]:
+) -> Tuple[bool, bool, bool, CallStateModel]:
     """
     Perform the chat with the LLM model.
 
@@ -290,11 +276,12 @@ async def _execute_llm_chat(
     1. `bool`, notify error
     2. `bool`, should retry chat
     3. `bool`, if the chat should continue
-    4. `CallModel`, the updated model
+    4. `CallStateModel`, the updated model
     """
     _logger.debug("Running LLM chat")
     content_full = ""
     should_user_answer = True
+    voice = CONFIG.voice.instance()
 
     async def _tools_callback(text: str, style: MessageStyleEnum) -> None:
         nonlocal content_full
@@ -326,9 +313,7 @@ async def _execute_llm_chat(
     # Build system prompts
     system = [
         ChatCompletionSystemMessageParam(
-            content=CONFIG.prompts.llm.default_system(
-                phone_number=call.phone_number,
-            ),
+            content=CONFIG.prompts.llm.default_system(call=call),
             role="system",
         ),
         ChatCompletionSystemMessageParam(
@@ -342,9 +327,9 @@ async def _execute_llm_chat(
 
     # Build plugins
     plugins = LlmPlugins(
+        background_tasks=background_tasks,
         call=call,
         cancellation_callback=_tools_cancellation_callback,
-        client=client,
         post_call_intelligence=lambda call: post_call_intelligence(
             call, background_tasks
         ),
@@ -377,7 +362,7 @@ async def _execute_llm_chat(
             else:
                 # Store whole content
                 content_full += delta.content
-                for sentence in tts_sentence_split(
+                for sentence in voice.tts_sentence_split(
                     content_full[content_buffer_pointer:], False
                 ):
                     content_buffer_pointer += len(sentence)

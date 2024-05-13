@@ -1,20 +1,20 @@
 {% extends "templates/base.html.jinja" %}
 
 {% block title %}
-Déclaration de sinistre {{ call.claim.claim_id }}
+Déclaration de sinistre
 {% endblock %}
 
 {% block content %}
 <!-- Top introduction -->
 <header class="col-span-full my-8 px-4">
   <div class="mb-4 text-neutral-600 dark:text-neutral-400">
-    <a class="hover:underline" href="/report/{{ call.phone_number | quote_plus }}">
+    <a class="hover:underline" href="/report/{{ call.initiate.phone_number | quote_plus }}">
       ⬅ Go back to your call history
     </a>
   </div>
 
-  <h1>Bonjour {{ call.claim.policyholder_name | title }} 👋🏻</h1>
-  <p class="text-2xl">Votre sinistre <span class="font-mono">#{{ call.claim.claim_id }}</span> à propos de {{ call.synthesis.short | lower }} est en cours de traitement.</p>
+  <h1>Bonjour {{ call.customer_file.caller_name | title }} 👋🏻</h1>
+  <p class="text-2xl">Votre sinistre à propos de {{ call.synthesis.short | lower }} est en cours de traitement.</p>
 </header>
 
 <!-- Long synthesis -->
@@ -40,7 +40,7 @@ Déclaration de sinistre {{ call.claim.claim_id }}
     <div class="overflow-hidden space-y-6">
       {% for message in call.messages | sort(attribute='created_at') %}
         {% if not (message.action == 'talk' and not message.content) %}
-        {% set name = bot_name if message.persona == 'assistant' else call.claim.policyholder_name %}
+        {% set name = bot_name if message.persona == 'assistant' else call.customer_file.caller_name %}
         <div class="flex flex-row">
           <div class="basis-6 relative self-stretch">
             <div class="absolute top-0 left-0 w-full h-full -z-10">
@@ -149,23 +149,23 @@ Déclaration de sinistre {{ call.claim.claim_id }}
           set details = [
             {
               'title': 'Date',
-              'value': call.claim.incident_date_time.strftime('%d %b %Y, %H:%M') if call.claim.incident_date_time else 'N/A'
+              'value': call.customer_file.incident_datetime.strftime('%d %b %Y, %H:%M') if call.customer_file.incident_datetime else 'N/A'
             },
             {
               'title': 'Localisation',
-              'value': call.claim.incident_location or 'N/A'
+              'value': call.customer_file.incident_location or 'N/A'
             },
             {
               'title': 'Police',
-              'value': call.claim.policy_number or 'N/A'
+              'value': call.customer_file.policy_number or 'N/A'
             },
             {
               'title': 'Contact',
-              'value': ((call.claim.policyholder_email | lower) or 'N/A') ~ ', ' ~ (call.claim.policyholder_phone or 'N/A')
+              'value': ((call.customer_file.caller_email | lower) or 'N/A') ~ ', ' ~ (call.customer_file.caller_phone or 'N/A')
             },
             {
               'title': 'Téléphone utilisé',
-              'value': call.phone_number or 'N/A'
+              'value': call.initiate.phone_number or 'N/A'
             }
           ]
         %}

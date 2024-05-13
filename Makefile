@@ -12,10 +12,7 @@ app_location := westeurope
 openai_location := southcentralus
 search_location := northeurope
 # App configuration
-agent_phone_number ?= $(shell cat config.yaml | yq '.workflow.agent_phone_number')
-bot_company ?= $(shell cat config.yaml | yq '.workflow.bot_company')
-bot_name ?= $(shell cat config.yaml | yq '.workflow.bot_name')
-bot_phone_number ?= $(shell cat config.yaml | yq '.communication_service.phone_number')
+bot_phone_number ?= $(shell cat config.yaml | yq '.communication_services.phone_number')
 event_subscription_name ?= $(shell echo '$(name)-$(bot_phone_number)' | tr -dc '[:alnum:]-')
 # Bicep outputs
 app_url ?= $(shell az deployment sub show --name $(name) | yq '.properties.outputs["appUrl"].value')
@@ -65,7 +62,7 @@ test:
 	@echo "➡️ Running deptry..."
 	python3 -m deptry \
 		--ignore-notebooks \
-		--per-rule-ignores "DEP002=aiohttp|gunicorn" \
+		--per-rule-ignores "DEP002=aiohttp|gunicorn|uvicorn" \
 		.
 
 	@echo "➡️ Running Pytest..."
@@ -85,7 +82,7 @@ lint:
 
 tunnel:
 	@echo "➡️ Creating tunnel..."
-	devtunnel show $(tunnel_name) || devtunnel create $(tunnel_name) --allow-anonymous --expiration 1d
+	devtunnel show $(tunnel_name) || devtunnel create $(tunnel_name) --allow-anonymous --expiration 7d
 
 	@echo "➡️ Creating port forwarding..."
 	devtunnel port show $(tunnel_name) --port-number 8080 || devtunnel port create $(tunnel_name) --port-number 8080
@@ -100,6 +97,7 @@ dev:
 		--reload \
 		--reload-extra-file .env \
 		--reload-extra-file config.yaml \
+		--timeout 120 \
 		--worker-class uvicorn.workers.UvicornWorker
 
 build:
@@ -130,9 +128,6 @@ deploy:
 	az deployment sub create \
 		--location $(app_location) \
 		--parameters \
-			'agentPhoneNumber=$(agent_phone_number)' \
-			'botCompany=$(bot_company)' \
-			'botName=$(bot_name)' \
 			'openaiLocation=$(openai_location)' \
 			'searchLocation=$(search_location)' \
 		--template-file bicep/main.bicep \
@@ -149,7 +144,7 @@ post-deploy:
 		name=$(name) \
 		source=$(communication_id)
 
-	@echo "🚀 Claim AI is running on $(app_url)"
+	@echo "🚀 Call Center AI is running on $(app_url)"
 	$(MAKE) logs name=$(name)
 
 destroy:
@@ -166,7 +161,7 @@ logs:
 	az containerapp logs show \
 		--follow \
 		--format text \
-		--name claim-ai \
+		--name call-center-ai \
 		--resource-group $(name) \
 		--tail 100
 
@@ -185,7 +180,7 @@ eventgrid-register:
 	az eventgrid event-subscription create \
 		--advanced-filter data.to.PhoneNumber.Value StringBeginsWith $(bot_phone_number) \
 		--enable-advanced-filtering-on-arrays true \
-		--endpoint $(endpoint)/call/inbound \
+		--endpoint $(endpoint)/call/eventgrid \
 		--event-delivery-schema eventgridschema \
 		--event-ttl 3 \
 		--included-event-types Microsoft.Communication.IncomingCall \
@@ -207,6 +202,6 @@ watch-call:
 	@echo "👀 Watching status of $(phone_number)..."
 	while true; do \
 		clear; \
-		curl -s "$(endpoint)/call?phone_number=%2B$(phone_number)" | yq --prettyPrint '.[0] | {"phone_number": .phone_number, "claim": .claim, "reminders": .reminders}'; \
+		curl -s "$(endpoint)/call?phone_number=%2B$(phone_number)" | yq --prettyPrint '.[0] | {"phone_number": .phone_number, "customer_file": .customer_file, "reminders": .reminders}'; \
 		sleep 3; \
 	done

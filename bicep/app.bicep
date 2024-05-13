@@ -1,8 +1,5 @@
 param adaModel string
 param adaVersion string
-param agentPhoneNumber string
-param botCompany string
-param botName string
 param gptBackupContext int
 param gptBackupModel string
 param gptBackupVersion string
@@ -44,12 +41,14 @@ var config = {
     public_url: storageAccount.properties.primaryEndpoints.web
   }
   workflow: {
-    agent_phone_number: agentPhoneNumber
-    bot_company: botCompany
-    bot_name: botName
-    lang: localConfig.workflow.lang
+    default_initiate: {
+      bot_company: localConfig.workflow.default_initiate.bot_company
+      bot_name: localConfig.workflow.default_initiate.bot_name
+      lang: localConfig.workflow.default_initiate.lang
+      transfer_phone_number: localConfig.workflow.default_initiate.transfer_phone_number
+    }
   }
-  communication_service: {
+  communication_services: {
     access_key: communication.listKeys().primaryKey
     endpoint: communication.properties.hostName
     phone_number: localConfig.communication_service.phone_number
@@ -375,7 +374,7 @@ resource gptBackup 'Microsoft.CognitiveServices/accounts/deployments@2023-10-01-
   parent: cognitiveOpenai
   name: gptBackupModelFullName
   sku: {
-    capacity: 80
+    capacity: 240
     name: 'Standard'  // Pay-as-you-go
   }
   properties: {
@@ -451,7 +450,7 @@ resource ada 'Microsoft.CognitiveServices/accounts/deployments@2023-10-01-previe
   parent: cognitiveOpenai
   name: adaModelFullName
   sku: {
-    capacity: 150
+    capacity: 240
     name: 'Standard'  // Pay-as-you-go
   }
   properties: {
@@ -519,7 +518,7 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
             ]
           }
           {
-            path: '/claim/policyholder_phone/?'
+            path: '/customer_file/caller_phone/?'
             indexes: [
               {
                 dataType: 'String'
@@ -537,7 +536,7 @@ resource container 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/container
       }
       partitionKey: {
         paths: [
-          '/phone_number'
+          '/initiate/phone_number'
         ]
         kind: 'Hash'
       }

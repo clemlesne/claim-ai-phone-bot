@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from models.call import CallModel
+from models.call import CallStateModel
 from models.readiness import ReadinessStatus
 from models.training import TrainingModel
 from persistence.icache import ICache
@@ -18,6 +18,6 @@ class ISearch(ABC):
 
     @abstractmethod
     async def training_asearch_all(
-        self, text: str, call: CallModel
+        self, text: str, call: CallStateModel
     ) -> Optional[list[TrainingModel]]:
         pass

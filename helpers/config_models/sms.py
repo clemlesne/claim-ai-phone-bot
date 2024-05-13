@@ -2,8 +2,7 @@ from enum import Enum
 from functools import cache
 from helpers.pydantic_types.phone_numbers import PhoneNumber
 from persistence.isms import ISms
-from persistence.istore import IStore
-from pydantic import field_validator, SecretStr, Field, BaseModel, ValidationInfo
+from pydantic import field_validator, SecretStr, BaseModel, ValidationInfo
 from typing import Optional
 
 
@@ -12,7 +11,7 @@ class ModeEnum(str, Enum):
     TWILIO = "twilio"
 
 
-class CommunicationServiceModel(BaseModel, frozen=True):
+class CommunicationServicesModel(BaseModel, frozen=True):
     """
     Represents the configuration for the Communication Services API.
 
@@ -24,7 +23,7 @@ class CommunicationServiceModel(BaseModel, frozen=True):
         from persistence.communication_services import CommunicationServicesSms
         from helpers.config import CONFIG
 
-        return CommunicationServicesSms(CONFIG.communication_service)
+        return CommunicationServicesSms(CONFIG.communication_services)
 
 
 class TwilioModel(BaseModel, frozen=True):
@@ -40,8 +39,8 @@ class TwilioModel(BaseModel, frozen=True):
 
 
 class SmsModel(BaseModel):
-    communication_services: Optional[CommunicationServiceModel] = (
-        CommunicationServiceModel()
+    communication_services: Optional[CommunicationServicesModel] = (
+        CommunicationServicesModel()
     )  # Object is fully defined by default
     mode: ModeEnum = ModeEnum.COMMUNICATION_SERVICES
     twilio: Optional[TwilioModel] = None
@@ -49,9 +48,9 @@ class SmsModel(BaseModel):
     @field_validator("communication_services")
     def _validate_communication_services(
         cls,
-        communication_services: Optional[CommunicationServiceModel],
+        communication_services: Optional[CommunicationServicesModel],
         info: ValidationInfo,
-    ) -> Optional[CommunicationServiceModel]:
+    ) -> Optional[CommunicationServicesModel]:
         if (
             not communication_services
             and info.data.get("mode", None) == ModeEnum.COMMUNICATION_SERVICES

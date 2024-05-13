@@ -12,9 +12,6 @@ class ReadinessCheckModel(BaseModel):
     id: str
     status: ReadinessStatus
 
-    class Config:
-        use_enum_values = True
-
 
 class ReadinessModel(BaseModel):
     checks: List[ReadinessCheckModel]

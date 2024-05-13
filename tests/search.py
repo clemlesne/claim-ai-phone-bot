@@ -1,13 +1,103 @@
-from deepeval.models.base_model import DeepEvalBaseLLM
+from deepeval import assert_test
+from deepeval.metrics import BaseMetric
+from deepeval.metrics.indicator import metric_progress_indicator
+from deepeval.models.gpt_model import GPTModel
+from deepeval.test_case import LLMTestCase
 from helpers.config import CONFIG
 from helpers.logging import build_logger
-from models.call import CallModel
-from models.training import TrainingModel
+from models.call import CallStateModel
+from typing import Optional
+import asyncio
 import pytest
 
 
 _logger = build_logger(__name__)
-_search = CONFIG.ai_search.instance()
+
+
+class RagRelevancyMetric(BaseMetric):
+    model: GPTModel
+    score: Optional[float] = 0
+    success: bool = False
+    threshold: float
+
+    def __init__(
+        self,
+        model: GPTModel,
+        threshold: float = 0.5,
+    ):
+        self.threshold = threshold
+        self.model = model
+
+    async def a_measure(self, test_case: LLMTestCase) -> float:
+        assert test_case.input
+        assert test_case.retrieval_context
+        # Measure each document in parallel
+        with metric_progress_indicator(self, async_mode=True):
+            scores = await asyncio.gather(
+                *[
+                    self._measure_single(test_case.input, document)
+                    for document in test_case.retrieval_context
+                ]
+            )
+            # Score is the average
+            self.score = sum(scores) / len(scores)
+        # Test against the threshold
+        self.success = self.score >= self.threshold
+        return self.score
+
+    async def _measure_single(self, message: str, document: str) -> float:
+        score = 0
+        llm_res, _ = await self.model.a_generate(
+            f"""
+            Assistant is a data analyst expert with 20 years of experience.
+
+            # Objective
+            Assistant will analyze a document and decide whether it would be useful to respond to the user message.
+
+            # Context
+            The document comes from a database. It has been stemmed. It may contains technical data and jargon a specialist would use.
+
+            # Rules
+            - Answer only with the float value, never add other text
+            - Response 0.0 means not useful at all, 1.0 means totally useful
+
+            # Message
+            {message}
+
+            # Document
+            {document}
+
+            # Response format
+            A float from 0.0 to 1.0
+
+            ## Example 1
+            Message: I love bananas
+            Document: bananas are yellow, apples are red
+            Assistant: 1
+
+            ## Example 2
+            Message: The sky is blue
+            Document: mouse is a rodent, mouse is a computer peripheral
+            Assistant: 0
+
+            ## Example 3
+            Message: my car is stuck in the mud
+            Document: car accidents must be reported within 24 hours, car accidents are dangerous
+            Assistant: 0.7
+        """
+        )
+        try:
+            score = float(llm_res)
+        except ValueError:
+            raise ValueError(f"LLM response is not a number: {llm_res}")
+        return score
+
+    def is_successful(self) -> bool:
+        return self.success
+
+    @property
+    def __name__(self):
+        return "RAG Relevancy"
 
 
 @pytest.mark.parametrize(
@@ -38,13 +128,13 @@ _search = CONFIG.ai_search.instance()
 @pytest.mark.asyncio  # Allow async functions
 @pytest.mark.repeat(10)  # Catch multi-threading and concurrency issues
 async def test_relevancy(
-    call_mock: CallModel,
-    deepeval_model: DeepEvalBaseLLM,
+    call_mock: CallStateModel,
+    deepeval_model: GPTModel,
     user_lang: str,
     user_message: str,
 ) -> None:
     """
-    Test the relevancy of the user message to the training data.
+    Test the relevancy of the Message to the training data.
 
     Steps:
     1. Search for training data
@@ -53,62 +143,29 @@ async def test_relevancy(
 
     Test is repeated 10 times to catch multi-threading and concurrency issues.
     """
-    # Configure context
-    call_mock.lang.short_code = user_lang
+    search = CONFIG.ai_search.instance()
+    call_mock.lang = user_lang
 
     # Init data
-    data_models = await _search.training_asearch_all(user_message, call_mock)
-    data_str = ", ".join([d.content for d in data_models or []])
+    res_models = await search.training_asearch_all(user_message, call_mock)
+    res_list = [d.content for d in res_models or []]
 
-    _logger.info(f"User message: {user_message}")
-    _logger.info(f"Data: {data_str}")
+    _logger.info(f"Message: {user_message}")
+    _logger.info(f"Data: {res_list}")
 
-    # Ask the LLM
-    llm_res = await deepeval_model.a_generate(
-        f"""
-        Assistant is a data analyst expert with 20 years of experience.
-
-        # Objective
-        The assistant will analyze the input data and decide whether it would be useful to respond to the user's message.
-
-        # Context
-        The data is a JSON list and comes from a database. The data has been stemmed.
-
-        # Rules
-        - Answer only with the float value, never add other text
-        - Response 0.0 means not useful at all, 1.0 means totally useful
-
-        # Input data
-        {data_str}
-
-        # User message
-        {user_message}
-
-        # Response format
-        A float from 0.0 to 1.0
-
-        ## Example 1
-        Input data: bananas are yellow, apples are red
-        User message: I love bananas
-        Assistant: 1
-
-        ## Example 2
-        Input data: mouse is a rodent, mouse is a computer peripheral
-        User message: The sky is blue
-        Assistant: 0
-
-        ## Example 3
-        Input data: car accidents must be reported within 24 hours, car accidents are dangerous
-        User message: my car is stuck in the mud
-        Assistant: 0.7
-    """
+    # Configure LLM tests
+    test_case = LLMTestCase(
+        actual_output="",  # Not used
+        input=user_message,
+        retrieval_context=res_list,
     )
-    try:
-        llm_score = float(llm_res)
-    except ValueError:
-        raise ValueError(f"LLM response is not a number: {llm_res}")
 
-    # Assert
-    assert (
-        llm_score >= 0.5
-    ), f"Analysis failed for {user_message}, LLM response {llm_score}"
+    # Define LLM metrics
+    llm_metrics = [
+        RagRelevancyMetric(
+            threshold=0.5, model=deepeval_model
+        ),  # Compare input to the retrieval context
+    ]
+
+    # Execute LLM tests
+    assert_test(test_case, llm_metrics)

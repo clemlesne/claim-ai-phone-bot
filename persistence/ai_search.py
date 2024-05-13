@@ -9,7 +9,7 @@ from azure.search.documents.models import VectorizableTextQuery
 from contextlib import asynccontextmanager
 from helpers.config_models.ai_search import AiSearchModel
 from helpers.logging import build_logger
-from models.call import CallModel
+from models.call import CallStateModel
 from models.readiness import ReadinessStatus
 from models.training import TrainingModel
 from persistence.icache import ICache
@@ -60,7 +60,7 @@ class AiSearchSearch(ISearch):
         wait=wait_random_exponential(multiplier=0.5, max=30),
     )
     async def training_asearch_all(
-        self, text: str, call: CallModel
+        self, text: str, call: CallStateModel
     ) -> Optional[list[TrainingModel]]:
         _logger.debug(f'Searching training data for "{text}"')
         if not text:
@@ -72,9 +72,8 @@ class AiSearchSearch(ISearch):
         if cached:
             try:
                 return TypeAdapter(list[TrainingModel]).validate_json(cached)
-            except ValidationError:
-                _logger.warning(f"Error parsing cached training: {cached}")
-                pass
+            except ValidationError as e:
+                _logger.debug(f"Parsing error: {e.errors()}")
 
         # Try live
         trainings: list[TrainingModel] = []
@@ -95,9 +94,7 @@ class AiSearchSearch(ISearch):
                     # Vector search
                     vector_queries=[
                         VectorizableTextQuery(
-                            exhaustive=True,  # Use exhaustive k-nearest neighbors (KNN)
                             fields="vectors",
-                            k_nearest_neighbors=50,  # TODO: Fine-tune this?
                             text=text,
                         )
                     ],
@@ -111,8 +108,6 @@ class AiSearchSearch(ISearch):
                     top=self._config.top_k,
                 )
                 async for result in results:
-                    if not result:
-                        continue
                     try:
                         trainings.append(
                             TrainingModel.model_validate(
@@ -125,7 +120,7 @@ class AiSearchSearch(ISearch):
                             )
                         )
                     except ValidationError as e:
-                        _logger.warning(f"Error parsing training: {e.errors()}")
+                        _logger.debug(f"Parsing error: {e.errors()}")
         except HttpResponseError as e:
             _logger.error(f"Error requesting AI Search, {e}")
         except ServiceRequestError as e:
