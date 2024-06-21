@@ -9,7 +9,7 @@ azure-eventgrid==4.19.0
 azure-functions==1.19.0
 azure-identity==1.16.0  # Required for all Azure SDKs
 azure-monitor-opentelemetry==1.4.2
-azure-search-documents==11.6.0b3
+azure-search-documents==11.6.0b4
 azure-storage-queue==12.10.0
 django-htmlmin==0.11.0
 jinja2==3.1.4
