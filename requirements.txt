@@ -6,7 +6,7 @@ azure-communication-sms==1.0.1
 azure-cosmos==4.7.0
 azure-eventgrid==4.20.0
 azure-functions==1.20.0
-azure-identity==1.17.0  # Required for all Azure SDKs
+azure-identity==1.17.1  # Required for all Azure SDKs
 azure-monitor-opentelemetry==1.6.0
 azure-search-documents==11.6.0b4
 azure-storage-queue==12.10.0
