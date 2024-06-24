@@ -23,7 +23,7 @@ opentelemetry-instrumentation-sqlite3==0.46b0
 opentelemetry-semantic-conventions==0.46b0
 phonenumbers==8.13.39  # Required for pydantic-extra-types
 pydantic-extra-types==2.8.2  # Required for pydantic
-pydantic-settings==2.3.3
+pydantic-settings==2.3.4
 pydantic[email]==2.7.4
 python-dotenv==1.0.1
 pytz==2024.1
