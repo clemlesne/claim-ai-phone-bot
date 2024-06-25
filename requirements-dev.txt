@@ -1,5 +1,5 @@
 black[jupyter]==24.4.2
-deepeval==0.21.59
+deepeval==0.21.62
 deptry==0.16.1
 pur==7.3.2
 pytest-assume==2.4.3
