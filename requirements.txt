@@ -29,7 +29,7 @@ python-dotenv==1.0.1
 pytz==2024.1
 pyyaml==6.0.1
 redis==5.0.6
-tenacity==8.2.3
+tenacity==8.4.2
 tiktoken==0.7.0
 twilio==9.2.1
 typing-extensions==4.12.2
